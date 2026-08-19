@@ -700,7 +700,7 @@ void RegAlloc::EmitMove(size_t bit_width, HostLoc to, HostLoc from) {
             MAYBE_AVX(movd, HostLocToReg64(to).cvt32(), HostLocToXmm(from));
         }
     } else if (HostLocIsXMM(to) && HostLocIsSpill(from)) {
-        const Xbyak::Address spill_addr = SpillToOpArg(from);
+        const Xbyak::Address spill_addr = SpillToOpArg(bit_width, from);
         ASSERT(spill_addr.getBit() >= bit_width);
         switch (bit_width) {
         case 128:
@@ -718,7 +718,7 @@ void RegAlloc::EmitMove(size_t bit_width, HostLoc to, HostLoc from) {
             UNREACHABLE();
         }
     } else if (HostLocIsSpill(to) && HostLocIsXMM(from)) {
-        const Xbyak::Address spill_addr = SpillToOpArg(to);
+        const Xbyak::Address spill_addr = SpillToOpArg(bit_width, to);
         ASSERT(spill_addr.getBit() >= bit_width);
         switch (bit_width) {
         case 128:
@@ -738,16 +738,16 @@ void RegAlloc::EmitMove(size_t bit_width, HostLoc to, HostLoc from) {
     } else if (HostLocIsGPR(to) && HostLocIsSpill(from)) {
         ASSERT(bit_width != 128);
         if (bit_width == 64) {
-            code.mov(HostLocToReg64(to), SpillToOpArg(from));
+            code.mov(HostLocToReg64(to), SpillToOpArg(bit_width, from));
         } else {
-            code.mov(HostLocToReg64(to).cvt32(), SpillToOpArg(from));
+            code.mov(HostLocToReg64(to).cvt32(), SpillToOpArg(bit_width, from));
         }
     } else if (HostLocIsSpill(to) && HostLocIsGPR(from)) {
         ASSERT(bit_width != 128);
         if (bit_width == 64) {
-            code.mov(SpillToOpArg(to), HostLocToReg64(from));
+            code.mov(SpillToOpArg(bit_width, to), HostLocToReg64(from));
         } else {
-            code.mov(SpillToOpArg(to), HostLocToReg64(from).cvt32());
+            code.mov(SpillToOpArg(bit_width, to), HostLocToReg64(from).cvt32());
         }
     } else {
         ASSERT_FALSE("Invalid RegAlloc::EmitMove");
@@ -764,14 +764,22 @@ void RegAlloc::EmitExchange(HostLoc a, HostLoc b) {
     }
 }
 
-Xbyak::Address RegAlloc::SpillToOpArg(HostLoc loc) {
+Xbyak::Address RegAlloc::SpillToOpArg(size_t bit_width, HostLoc loc) {
     ASSERT(HostLocIsSpill(loc));
 
     size_t i = static_cast<size_t>(loc) - static_cast<size_t>(HostLoc::FirstSpill);
     ASSERT_MSG(i < SpillCount, "Spill index greater than number of available spill locations");
 
     using namespace Xbyak::util;
-    return xword[rsp + reserved_stack_space + ABI_SHADOW_SPACE + offsetof(StackLayout, spill) + i * sizeof(StackLayout::spill[0])];
+    const auto address = rsp + reserved_stack_space + ABI_SHADOW_SPACE + offsetof(StackLayout, spill) +
+                         i * sizeof(StackLayout::spill[0]);
+    if (bit_width == 128) {
+        return xword[address];
+    }
+    if (bit_width == 64) {
+        return qword[address];
+    }
+    return dword[address];
 }
 
 }  // namespace Dynarmic::Backend::X64

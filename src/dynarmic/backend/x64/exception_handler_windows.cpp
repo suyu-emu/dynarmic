@@ -6,7 +6,9 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 #include <mcl/assert.hpp>
@@ -167,42 +169,56 @@ static PrologueInformation GetPrologueInformation() {
     return ret;
 }
 
+namespace {
+
+// Registry of JIT code regions with active fastmem callbacks, consulted by the vectored
+// exception handler below. Guarded by veh_mutex. `cb` points at the owning Impl's
+// std::function member, whose address is stable for the Impl's lifetime; entries are
+// removed in ~Impl before the member is destroyed.
+struct VehRegion {
+    u64 begin;
+    u64 end;
+    const std::function<FakeCall(u64)>* cb;
+};
+
+std::mutex veh_mutex;
+std::vector<VehRegion> veh_regions;
+bool veh_installed = false;
+
+LONG CALLBACK FastmemVectoredHandler(EXCEPTION_POINTERS* ep);
+
+void EnsureVehInstalled() {
+    // Caller holds veh_mutex.
+    if (!veh_installed) {
+        // First = 1 so we run before other handlers and before any SEH dispatch.
+        AddVectoredExceptionHandler(1, FastmemVectoredHandler);
+        veh_installed = true;
+    }
+}
+
+}  // anonymous namespace
+
 struct ExceptionHandler::Impl final {
-    Impl(BlockOfCode& code) {
+    Impl(BlockOfCode& code)
+            : code_begin{mcl::bit_cast<u64>(code.getCode())}
+            , code_end{code_begin + code.GetTotalCodeSize()} {
         const auto prolog_info = GetPrologueInformation();
 
+        // Register unwind information so that debuggers and RtlVirtualUnwind can walk
+        // through JIT frames. Fastmem fault recovery is NOT done through this SEH path:
+        // on recent Windows 11 builds, returning ExceptionContinueExecution from a
+        // language handler that rewrites the dispatch CONTEXT (the fake-call trick)
+        // intermittently makes RtlpExecuteHandlerForException call through a stack
+        // address, terminating the process with an execute-access violation at
+        // (faulting RSP - 0x700). Recovery is instead performed by a process-wide
+        // vectored exception handler (see FastmemVectoredHandler), which modifies the
+        // context and returns EXCEPTION_CONTINUE_EXECUTION before SEH dispatch begins.
         code.align(16);
         const u8* exception_handler_without_cb = code.getCurr<u8*>();
         code.mov(code.eax, static_cast<u32>(ExceptionContinueSearch));
         code.ret();
 
-        code.align(16);
-        const u8* exception_handler_with_cb = code.getCurr<u8*>();
-        // Our 3rd argument is a PCONTEXT.
-
-        // If not within our codeblock, ignore this exception.
-        code.mov(code.rax, Safe::Negate(mcl::bit_cast<u64>(code.getCode())));
-        code.add(code.rax, code.qword[code.ABI_PARAM3 + Xbyak::RegExp(offsetof(CONTEXT, Rip))]);
-        code.cmp(code.rax, static_cast<u32>(code.GetTotalCodeSize()));
-        code.ja(exception_handler_without_cb);
-
-        code.sub(code.rsp, 8);
-        code.mov(code.ABI_PARAM1, mcl::bit_cast<u64>(&cb));
-        code.mov(code.ABI_PARAM2, code.ABI_PARAM3);
-        code.CallLambda(
-            [](const std::function<FakeCall(u64)>& cb_, PCONTEXT ctx) {
-                FakeCall fc = cb_(ctx->Rip);
-
-                ctx->Rsp -= sizeof(u64);
-                *mcl::bit_cast<u64*>(ctx->Rsp) = fc.ret_rip;
-                ctx->Rip = fc.call_rip;
-            });
-        code.add(code.rsp, 8);
-        code.mov(code.eax, static_cast<u32>(ExceptionContinueExecution));
-        code.ret();
-
         exception_handler_without_cb_offset = static_cast<ULONG>(exception_handler_without_cb - code.getCode<u8*>());
-        exception_handler_with_cb_offset = static_cast<ULONG>(exception_handler_with_cb - code.getCode<u8*>());
 
         code.align(16);
         UNWIND_INFO* unwind_info = static_cast<UNWIND_INFO*>(code.AllocateFromCodeSpace(sizeof(UNWIND_INFO)));
@@ -230,11 +246,25 @@ struct ExceptionHandler::Impl final {
     }
 
     void SetCallback(std::function<FakeCall(u64)> new_cb) {
-        cb = new_cb;
-        except_info->ExceptionHandler = cb ? exception_handler_with_cb_offset : exception_handler_without_cb_offset;
+        std::scoped_lock lock{veh_mutex};
+        cb = std::move(new_cb);
+        if (cb) {
+            EnsureVehInstalled();
+            const auto it = std::find_if(veh_regions.begin(), veh_regions.end(),
+                                         [this](const VehRegion& r) { return r.cb == &cb; });
+            if (it == veh_regions.end()) {
+                veh_regions.push_back(VehRegion{code_begin, code_end, &cb});
+            }
+        } else {
+            std::erase_if(veh_regions, [this](const VehRegion& r) { return r.cb == &cb; });
+        }
     }
 
     ~Impl() {
+        {
+            std::scoped_lock lock{veh_mutex};
+            std::erase_if(veh_regions, [this](const VehRegion& r) { return r.cb == &cb; });
+        }
         RtlDeleteFunctionTable(rfuncs);
     }
 
@@ -243,8 +273,40 @@ private:
     std::function<FakeCall(u64)> cb;
     UNW_EXCEPTION_INFO* except_info;
     ULONG exception_handler_without_cb_offset;
-    ULONG exception_handler_with_cb_offset;
+    u64 code_begin;
+    u64 code_end;
 };
+
+namespace {
+
+LONG CALLBACK FastmemVectoredHandler(EXCEPTION_POINTERS* ep) {
+    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    PCONTEXT ctx = ep->ContextRecord;
+    const u64 rip = ctx->Rip;
+
+    std::scoped_lock lock{veh_mutex};
+    for (const VehRegion& region : veh_regions) {
+        if (rip >= region.begin && rip < region.end) {
+            const FakeCall fc = (*region.cb)(rip);
+            // Emulate a call: push the resume address, then jump to the fallback thunk.
+            // Applied directly from the vectored handler via NtContinue, without ever
+            // entering the (broken) SEH language-handler dispatch path.
+            ctx->Rsp -= sizeof(u64);
+            *mcl::bit_cast<u64*>(ctx->Rsp) = fc.ret_rip;
+            ctx->Rip = fc.call_rip;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+}  // anonymous namespace
 
 ExceptionHandler::ExceptionHandler() = default;
 ExceptionHandler::~ExceptionHandler() = default;

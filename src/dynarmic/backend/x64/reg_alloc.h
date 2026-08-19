@@ -182,7 +182,7 @@ private:
     void EmitMove(size_t bit_width, HostLoc to, HostLoc from);
     void EmitExchange(HostLoc a, HostLoc b);
 
-    Xbyak::Address SpillToOpArg(HostLoc loc);
+    Xbyak::Address SpillToOpArg(size_t bit_width, HostLoc loc);
 };
 
 }  // namespace Dynarmic::Backend::X64
